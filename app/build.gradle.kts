@@ -10,6 +10,8 @@ android {
     defaultConfig {
         applicationId = "com.example.practice_6"
         minSdk = 26
+        // Se mantiene targetSdk = 36 para evitar las restricciones automáticas
+        // de red local introducidas obligatoriamente en Android 17 (API level 37).
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"

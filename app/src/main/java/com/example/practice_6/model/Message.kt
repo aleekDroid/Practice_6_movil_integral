@@ -7,24 +7,37 @@ import java.util.Locale
 import java.util.UUID
 
 /**
+ * Estado de entrega del mensaje dentro del protocolo con confirmación (ACK).
+ */
+enum class MessageStatus {
+    /** Pendiente de envío o esperando confirmación ACK. */
+    PENDING,
+
+    /** Confirmado exitosamente por el receptor mediante ACK. */
+    SENT,
+
+    /** Falló la transmisión por el socket TCP o expiró el timeout sin ACK. */
+    FAILED
+}
+
+/**
  * Modelo de datos que representa un mensaje individual en la conversación.
  *
- * Incluye utilidades para la serialización y deserialización a formato JSON
- * requeridas para el protocolo de red TCP de MobileConnect.
- *
- * @property id Identificador único para evitar duplicados de entrega.
- * @property text Contenido textual del mensaje (máximo 200 caracteres).
- * @property timestamp Hora de envío en formato legible HH:mm.
- * @property senderRole Rol del emisor en el momento de enviar (Dispositivo A o B).
+ * @property id Identificador único para confirmación ACK y deduplicación.
+ * @property text Contenido del mensaje.
+ * @property timestamp Hora de envío en formato HH:mm.
+ * @property senderRole Rol del emisor en el momento del envío (Dispositivo A o B).
+ * @property status Estado actual de confirmación de entrega (PENDING, SENT, FAILED).
  */
 data class Message(
     val id: String = UUID.randomUUID().toString(),
     val text: String,
     val timestamp: String = getCurrentFormattedTime(),
-    val senderRole: Role
+    val senderRole: Role,
+    val status: MessageStatus = MessageStatus.SENT
 ) {
     /**
-     * Convierte el mensaje a un objeto [JSONObject] para su transmisión por socket.
+     * Serializa el mensaje a un objeto [JSONObject] para su transmisión TCP.
      */
     fun toJsonObject(): JSONObject {
         return JSONObject().apply {
@@ -38,7 +51,7 @@ data class Message(
 
     companion object {
         /**
-         * Obtiene la hora actual del sistema en formato "HH:mm".
+         * Obtiene la hora actual en formato "HH:mm".
          */
         fun getCurrentFormattedTime(): String {
             val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
@@ -46,17 +59,15 @@ data class Message(
         }
 
         /**
-         * Reconstruye un objeto [Message] a partir de un [JSONObject] recibido por red.
-         *
-         * @param json Objeto JSON recibido por el socket TCP.
-         * @return Instancia de [Message] parseada.
+         * Deserializa un mensaje desde un [JSONObject] recibido.
          */
         fun fromJsonObject(json: JSONObject): Message {
             return Message(
                 id = json.optString("id", UUID.randomUUID().toString()),
                 text = json.optString("text", ""),
                 timestamp = json.optString("timestamp", getCurrentFormattedTime()),
-                senderRole = Role.fromString(json.optString("senderRole", "NONE"))
+                senderRole = Role.fromString(json.optString("senderRole", "NONE")),
+                status = MessageStatus.SENT
             )
         }
     }

@@ -6,7 +6,9 @@ import androidx.lifecycle.viewModelScope
 import com.example.practice_6.data.PreferencesManager
 import com.example.practice_6.domain.RoleManager
 import com.example.practice_6.model.Message
+import com.example.practice_6.model.MessageStatus
 import com.example.practice_6.model.Role
+import com.example.practice_6.network.NetworkDiagnosticState
 import com.example.practice_6.network.NetworkUtils
 import com.example.practice_6.network.SocketManager
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,11 +18,12 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 /**
- * Estado inmutable de la interfaz de usuario para la pantalla principal [MobileConnectApp].
+ * Estado completo inmutable de la interfaz gráfica y diagnóstico de red.
  */
 data class UiState(
     val localIp: String = "Detectando...",
     val remoteIpInput: String = "",
+    val remotePortInput: String = "8888",
     val connectedRemoteIp: String? = null,
     val isConnected: Boolean = false,
     val myRole: Role = Role.NONE,
@@ -28,6 +31,7 @@ data class UiState(
     val counterA: Int = 0,
     val counterB: Int = 0,
     val ipError: String? = null,
+    val portError: String? = null,
     val messageInput: String = "",
     val messageInputError: String? = null,
     val isConnecting: Boolean = false,
@@ -35,14 +39,16 @@ data class UiState(
     val connectionDialogTitle: String = "",
     val connectionDialogText: String = "",
     val showClearConfirmDialog: Boolean = false,
+    val showDiagnosticPanel: Boolean = false,
+    val diagnosticState: NetworkDiagnosticState = NetworkDiagnosticState(),
     val snackbarMessage: String? = null
 )
 
 /**
- * ViewModel principal de la arquitectura MVVM para MobileConnect.
+ * ViewModel principal de MobileConnect.
  *
- * Mantiene y sobrevive a rotaciones de pantalla, gestionando las operaciones
- * de red por sockets, persistencia y lógica de asignación automática de roles.
+ * Mantiene la conexión TCP persistente activa, gestiona el estado de entrega (ACK),
+ * reintentos de mensajes no entregados y expone información de diagnóstico.
  */
 class MainViewModel : ViewModel() {
 
@@ -56,7 +62,7 @@ class MainViewModel : ViewModel() {
     private var isInitialized = false
 
     /**
-     * Inicializa las utilidades de red, carga el historial guardado y arranca el servidor TCP.
+     * Inicializa la app, detecta la IP propia (incluyendo Hotspot) y arranca el servidor TCP.
      */
     fun init(context: Context) {
         if (isInitialized) return
@@ -64,24 +70,23 @@ class MainViewModel : ViewModel() {
 
         preferencesManager = PreferencesManager(context.applicationContext)
 
-        // 1. Detectar IP local
         val detectedLocalIp = NetworkUtils.getLocalIpAddress(context.applicationContext)
-
-        // 2. Cargar historial y rol persistido
         val savedHistory = preferencesManager.loadHistory()
         val savedRole = preferencesManager.loadRole()
         val savedRemoteIp = preferencesManager.loadRemoteIp()
+        val savedPort = preferencesManager.loadPort()
 
         roleManager = RoleManager(savedRole)
 
-        // Calcular contadores iniciales basados en el historial guardado
-        val countA = savedHistory.count { it.senderRole == Role.A }
-        val countB = savedHistory.count { it.senderRole == Role.B }
+        // Contar únicamente mensajes confirmados como ENVIADOS o recibidos
+        val countA = savedHistory.count { it.senderRole == Role.A && it.status == MessageStatus.SENT }
+        val countB = savedHistory.count { it.senderRole == Role.B && it.status == MessageStatus.SENT }
 
         _uiState.update { state ->
             state.copy(
                 localIp = detectedLocalIp,
                 remoteIpInput = savedRemoteIp,
+                remotePortInput = savedPort.toString(),
                 myRole = savedRole,
                 messages = savedHistory,
                 counterA = countA,
@@ -89,29 +94,28 @@ class MainViewModel : ViewModel() {
             )
         }
 
-        // 3. Configurar callbacks del servidor socket
-        setupSocketCallbacks()
+        // Observar diagnóstico del SocketManager
+        viewModelScope.launch {
+            socketManager.diagnosticState.collect { diag ->
+                _uiState.update { it.copy(diagnosticState = diag, isConnected = diag.isConnected) }
+            }
+        }
 
-        // 4. Iniciar servidor TCP en segundo plano
-        socketManager.startServer(viewModelScope)
+        setupSocketCallbacks()
+        socketManager.startServer(viewModelScope, savedPort)
     }
 
-    /**
-     * Registra las acciones a ejecutar cuando se reciben mensajes o eventos por el socket.
-     */
     private fun setupSocketCallbacks() {
         socketManager.onHelloReceived = { remoteIp, remoteRoleStr, remoteHasHistory ->
             viewModelScope.launch {
                 val localHasHistory = _uiState.value.messages.isNotEmpty()
 
-                // Procesar regla de roles mediante el RoleManager
                 val result = roleManager.processHandshake(
                     remoteRoleStr = remoteRoleStr,
                     remoteHasHistory = remoteHasHistory,
                     localHasHistory = localHasHistory
                 )
 
-                // Guardar nuevo rol y la IP del emisor automáticamente
                 preferencesManager.saveRole(result.assignedRole)
                 preferencesManager.saveRemoteIp(remoteIp)
 
@@ -136,7 +140,6 @@ class MainViewModel : ViewModel() {
 
         socketManager.onMessageReceived = { message ->
             viewModelScope.launch {
-                // Si el rol local no estaba definido, se actualiza automáticamente al complementario
                 val roleChanged = roleManager.onReceivingMessage(message.senderRole)
                 val currentRole = roleManager.currentRole
 
@@ -144,12 +147,12 @@ class MainViewModel : ViewModel() {
                     preferencesManager.saveRole(currentRole)
                 }
 
-                // Agregar mensaje al historial local
-                val updatedList = _uiState.value.messages + message
+                val confirmedMessage = message.copy(status = MessageStatus.SENT)
+                val updatedList = _uiState.value.messages + confirmedMessage
                 preferencesManager.saveHistory(updatedList)
 
-                val newCountA = updatedList.count { it.senderRole == Role.A }
-                val newCountB = updatedList.count { it.senderRole == Role.B }
+                val newCountA = updatedList.count { it.senderRole == Role.A && it.status == MessageStatus.SENT }
+                val newCountB = updatedList.count { it.senderRole == Role.B && it.status == MessageStatus.SENT }
 
                 _uiState.update { state ->
                     state.copy(
@@ -157,7 +160,7 @@ class MainViewModel : ViewModel() {
                         counterA = newCountA,
                         counterB = newCountB,
                         myRole = currentRole,
-                        snackbarMessage = "📥 Nuevo mensaje de ${message.senderRole.shortName()}"
+                        snackbarMessage = "📥 Nuevo mensaje recibido de ${message.senderRole.shortName()}"
                     )
                 }
             }
@@ -168,6 +171,18 @@ class MainViewModel : ViewModel() {
                 _uiState.update { state ->
                     state.copy(
                         snackbarMessage = "ℹ️ El dispositivo remoto ha limpiado su historial."
+                    )
+                }
+            }
+        }
+
+        socketManager.onConnectionDropped = { reason ->
+            viewModelScope.launch {
+                _uiState.update { state ->
+                    state.copy(
+                        isConnected = false,
+                        connectedRemoteIp = null,
+                        snackbarMessage = "⚠️ Conexión caída: $reason"
                     )
                 }
             }
@@ -184,40 +199,52 @@ class MainViewModel : ViewModel() {
         }
     }
 
-    /**
-     * Actualiza la entrada de texto de la IP del dispositivo remoto.
-     */
     fun onRemoteIpInputChanged(input: String) {
         _uiState.update { it.copy(remoteIpInput = input, ipError = null) }
     }
 
-    /**
-     * Realiza la validación de la IP e intenta establecer conexión enviando un paquete `HELLO`.
-     */
+    fun onRemotePortInputChanged(input: String) {
+        _uiState.update { it.copy(remotePortInput = input, portError = null) }
+    }
+
     fun onConnectClicked() {
         val currentState = _uiState.value
-        val validation = NetworkUtils.validateIpAddress(currentState.remoteIpInput, currentState.localIp)
+        val ipValidation = NetworkUtils.validateIpAddress(currentState.remoteIpInput, currentState.localIp)
+        val portValidation = NetworkUtils.validatePort(currentState.remotePortInput)
 
-        if (!validation.isValid) {
-            _uiState.update { it.copy(ipError = validation.errorMessage) }
+        if (!ipValidation.isValid) {
+            _uiState.update { it.copy(ipError = ipValidation.errorMessage) }
+            return
+        }
+
+        if (!portValidation.isValid) {
+            _uiState.update { it.copy(portError = portValidation.errorMessage) }
             return
         }
 
         val targetIp = currentState.remoteIpInput.trim()
+        val targetPort = portValidation.port
 
-        _uiState.update { it.copy(isConnecting = true, ipError = null) }
+        _uiState.update { it.copy(isConnecting = true, ipError = null, portError = null) }
 
         viewModelScope.launch {
-            val hasHistory = currentState.messages.isNotEmpty()
-            val result = socketManager.sendHello(
-                targetIp = targetIp,
-                localIp = currentState.localIp,
-                role = roleManager.currentRole.name,
-                hasHistory = hasHistory
+            val result = socketManager.connectToRemote(
+                scope = viewModelScope,
+                remoteIp = targetIp,
+                remotePort = targetPort,
+                localIp = currentState.localIp
             )
 
-            result.onSuccess {
-                preferencesManager.saveRemoteIp(targetIp)
+            result.onSuccess { actualRemoteIp ->
+                preferencesManager.saveRemoteIp(actualRemoteIp)
+                preferencesManager.savePort(targetPort)
+
+                // Enviar HELLO por la conexión persistente recíproca
+                val hasHistory = currentState.messages.isNotEmpty()
+                socketManager.sendHello(
+                    role = roleManager.currentRole.name,
+                    hasHistory = hasHistory
+                )
 
                 val roleMsg = if (roleManager.currentRole != Role.NONE) {
                     "\n\n${roleManager.currentRole.displayName()}"
@@ -227,11 +254,11 @@ class MainViewModel : ViewModel() {
                     state.copy(
                         isConnecting = false,
                         isConnected = true,
-                        connectedRemoteIp = targetIp,
+                        connectedRemoteIp = actualRemoteIp,
                         showConnectionDialog = true,
                         connectionDialogTitle = "Conexión establecida",
-                        connectionDialogText = "Conexión establecida con $targetIp.$roleMsg",
-                        snackbarMessage = "Conexión con $targetIp exitosa."
+                        connectionDialogText = "Conexión establecida con $actualRemoteIp en puerto $targetPort.$roleMsg",
+                        snackbarMessage = "Conectado exitosamente con $actualRemoteIp"
                     )
                 }
             }.onFailure { exception ->
@@ -240,7 +267,7 @@ class MainViewModel : ViewModel() {
                         isConnecting = false,
                         showConnectionDialog = true,
                         connectionDialogTitle = "Error de conexión",
-                        connectionDialogText = "No se pudo conectar con $targetIp:\n${exception.localizedMessage}",
+                        connectionDialogText = exception.localizedMessage ?: "No se pudo establecer la conexión TCP.",
                         snackbarMessage = "Error al intentar conectar."
                     )
                 }
@@ -248,9 +275,6 @@ class MainViewModel : ViewModel() {
         }
     }
 
-    /**
-     * Actualiza el texto del mensaje en redacción (con límite de 200 caracteres).
-     */
     fun onMessageInputChanged(input: String) {
         if (input.length <= 200) {
             _uiState.update { it.copy(messageInput = input, messageInputError = null) }
@@ -258,13 +282,13 @@ class MainViewModel : ViewModel() {
     }
 
     /**
-     * Valida y envía el mensaje redactado por el socket al dispositivo remoto.
+     * Envía un mensaje con confirmación de entrega (ACK).
+     * Solo se marca como "enviado" y suma al contador si se recibe el ACK.
      */
     fun onSendMessageClicked() {
         val currentState = _uiState.value
         val trimmedText = currentState.messageInput.trim()
 
-        // VALIDACIÓN: No enviar mensajes vacíos o solo espacios
         if (trimmedText.isBlank()) {
             _uiState.update {
                 it.copy(
@@ -275,67 +299,79 @@ class MainViewModel : ViewModel() {
             return
         }
 
-        val targetIp = currentState.connectedRemoteIp ?: currentState.remoteIpInput.trim()
-        if (targetIp.isBlank()) {
-            _uiState.update { it.copy(snackbarMessage = "⚠️ No hay IP remota configurada para enviar.") }
-            return
-        }
-
-        // Determinar rol del emisor (si es el primer mensaje, pasa a ser A)
         val assignedRole = roleManager.onSendingFirstMessage()
         preferencesManager.saveRole(assignedRole)
 
-        val newMessage = Message(
+        val pendingMessage = Message(
             text = trimmedText,
-            senderRole = assignedRole
+            senderRole = assignedRole,
+            status = MessageStatus.PENDING
         )
 
+        // Agregar mensaje en estado PENDING a la vista
+        val initialList = currentState.messages + pendingMessage
+        _uiState.update { it.copy(messageInput = "", messages = initialList, myRole = assignedRole) }
+
+        sendMessageWithAckInternal(pendingMessage)
+    }
+
+    /**
+     * Reintenta el envío de un mensaje que previamente falló.
+     */
+    fun retrySendMessage(message: Message) {
+        sendMessageWithAckInternal(message)
+    }
+
+    private fun sendMessageWithAckInternal(message: Message) {
         viewModelScope.launch {
-            val result = socketManager.sendMessage(targetIp, newMessage)
+            val result = socketManager.sendMessageWithAck(message)
 
             result.onSuccess {
-                val updatedList = currentState.messages + newMessage
+                // Marcar mensaje como SENT
+                val currentList = _uiState.value.messages
+                val updatedList = currentList.map { msg ->
+                    if (msg.id == message.id) msg.copy(status = MessageStatus.SENT) else msg
+                }
                 preferencesManager.saveHistory(updatedList)
 
-                val newCountA = updatedList.count { it.senderRole == Role.A }
-                val newCountB = updatedList.count { it.senderRole == Role.B }
+                val newCountA = updatedList.count { it.senderRole == Role.A && it.status == MessageStatus.SENT }
+                val newCountB = updatedList.count { it.senderRole == Role.B && it.status == MessageStatus.SENT }
 
                 _uiState.update { state ->
                     state.copy(
-                        messageInput = "",
                         messages = updatedList,
                         counterA = newCountA,
                         counterB = newCountB,
-                        myRole = assignedRole,
-                        snackbarMessage = "✅ Mensaje enviado"
+                        snackbarMessage = "✅ Mensaje entregado correctamente"
                     )
                 }
             }.onFailure { exception ->
+                // Marcar mensaje como FAILED
+                val currentList = _uiState.value.messages
+                val updatedList = currentList.map { msg ->
+                    if (msg.id == message.id) msg.copy(status = MessageStatus.FAILED) else msg
+                }
+                preferencesManager.saveHistory(updatedList)
+
                 _uiState.update { state ->
                     state.copy(
-                        snackbarMessage = "❌ Error al enviar mensaje: ${exception.localizedMessage}"
+                        messages = updatedList,
+                        snackbarMessage = "❌ Entrega no confirmada: ${exception.localizedMessage}"
                     )
                 }
             }
         }
     }
 
-    /**
-     * Muestra el diálogo de confirmación para limpiar el historial.
-     */
+    fun toggleDiagnosticPanel() {
+        _uiState.update { it.copy(showDiagnosticPanel = !it.showDiagnosticPanel) }
+    }
+
     fun onClearHistoryRequested() {
         _uiState.update { it.copy(showClearConfirmDialog = true) }
     }
 
-    /**
-     * Borra el historial de conversación, reinicia contadores y resetea el rol local.
-     * Avisa al otro dispositivo enviando un paquete `CLEAR`.
-     */
     fun confirmClearHistory() {
-        val currentState = _uiState.value
-        val targetIp = currentState.connectedRemoteIp ?: currentState.remoteIpInput.trim()
-
-        // Limpiar datos locales y resetear rol a NONE
         preferencesManager.clearHistoryAndRole()
         roleManager.onHistoryCleared()
 
@@ -346,42 +382,27 @@ class MainViewModel : ViewModel() {
                 counterB = 0,
                 myRole = Role.NONE,
                 showClearConfirmDialog = false,
-                snackbarMessage = "🧹 Historial y rol limpiados correctamente."
+                snackbarMessage = "🧹 Historial y rol limpiados."
             )
         }
 
-        // Avisar al otro dispositivo si hay una IP conectada
-        if (targetIp.isNotBlank()) {
-            viewModelScope.launch {
-                socketManager.sendClear(targetIp)
-            }
+        viewModelScope.launch {
+            socketManager.sendClear()
         }
     }
 
-    /**
-     * Oculta el diálogo de alerta de conexión.
-     */
     fun dismissConnectionDialog() {
         _uiState.update { it.copy(showConnectionDialog = false) }
     }
 
-    /**
-     * Oculta el diálogo de confirmación de limpieza de historial.
-     */
     fun dismissClearConfirmDialog() {
         _uiState.update { it.copy(showClearConfirmDialog = false) }
     }
 
-    /**
-     * Consume el mensaje del Snackbar después de mostrarlo en la UI.
-     */
     fun consumeSnackbarMessage() {
         _uiState.update { it.copy(snackbarMessage = null) }
     }
 
-    /**
-     * Recarga la IP local manualmente (útil si cambió la conexión Wi-Fi).
-     */
     fun refreshLocalIp(context: Context) {
         val currentIp = NetworkUtils.getLocalIpAddress(context.applicationContext)
         _uiState.update { it.copy(localIp = currentIp) }

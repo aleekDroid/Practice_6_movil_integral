@@ -20,7 +20,22 @@ class PreferencesManager(context: Context) {
     companion object {
         private const val KEY_ROLE = "key_assigned_role"
         private const val KEY_REMOTE_IP = "key_remote_ip"
+        private const val KEY_PORT = "key_remote_port"
         private const val KEY_HISTORY = "key_message_history"
+    }
+
+    /**
+     * Guarda el puerto remoto configurado.
+     */
+    fun savePort(port: Int) {
+        prefs.edit().putInt(KEY_PORT, port).apply()
+    }
+
+    /**
+     * Carga el puerto configurado (8888 por defecto).
+     */
+    fun loadPort(): Int {
+        return prefs.getInt(KEY_PORT, 8888)
     }
 
     /**

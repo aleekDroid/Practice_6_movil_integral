@@ -4,10 +4,10 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,11 +28,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -69,7 +72,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.practice_6.model.Message
+import com.example.practice_6.model.MessageStatus
 import com.example.practice_6.model.Role
+import com.example.practice_6.network.NetworkDiagnosticState
 import com.example.practice_6.ui.MainViewModel
 import com.example.practice_6.ui.UiState
 
@@ -78,10 +83,8 @@ import com.example.practice_6.ui.UiState
  * PRÁCTICA 6: Interacción entre Dispositivos Móviles - MobileConnect
  * ====================================================================================
  * Aplicación Android desarrollada en Kotlin y Jetpack Compose con arquitectura MVVM.
- * Permite el intercambio de mensajes breves en red local usando sockets TCP directos
- * (ServerSocket/Socket en puerto 8888) e IP local entre dos dispositivos.
- *
- * La asignación de roles (Dispositivo A / Dispositivo B) es 100% automática y transparente.
+ * Permite el intercambio bidireccional y persistente de mensajes por sockets TCP en red local
+ * con confirmación de entrega (ACK), monitoreo keepalive (PING/PONG) y panel de diagnóstico.
  * ====================================================================================
  */
 class MainActivity : ComponentActivity() {
@@ -99,24 +102,25 @@ class MainActivity : ComponentActivity() {
                 ) {
                     val context = LocalContext.current
 
-                    // Inicializar el ViewModel (red, base de datos SharedPreferences y servidor TCP)
                     LaunchedEffect(Unit) {
                         viewModel.init(context)
                     }
 
-                    // Colección del estado reactivo mediante Flow
                     val uiState by viewModel.uiState.collectAsState()
 
                     MobileConnectApp(
                         uiState = uiState,
                         onRemoteIpChanged = viewModel::onRemoteIpInputChanged,
+                        onRemotePortChanged = viewModel::onRemotePortInputChanged,
                         onConnectClicked = viewModel::onConnectClicked,
                         onMessageInputChanged = viewModel::onMessageInputChanged,
                         onSendMessageClicked = viewModel::onSendMessageClicked,
+                        onRetrySendMessage = viewModel::retrySendMessage,
                         onClearHistoryClicked = viewModel::onClearHistoryRequested,
                         onConfirmClearHistory = viewModel::confirmClearHistory,
                         onDismissClearConfirm = viewModel::dismissClearConfirmDialog,
                         onDismissConnectionDialog = viewModel::dismissConnectionDialog,
+                        onToggleDiagnosticPanel = viewModel::toggleDiagnosticPanel,
                         onRefreshLocalIp = { viewModel.refreshLocalIp(context) },
                         onConsumeSnackbar = viewModel::consumeSnackbarMessage
                     )
@@ -128,29 +132,28 @@ class MainActivity : ComponentActivity() {
 
 /**
  * COMPOSABLE PRINCIPAL: MobileConnectApp
- *
- * Renderiza la interfaz gráfica completa dividida en 5 secciones verticales
- * siguiendo las especificaciones del diseño funcional.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MobileConnectApp(
     uiState: UiState,
     onRemoteIpChanged: (String) -> Unit,
+    onRemotePortChanged: (String) -> Unit,
     onConnectClicked: () -> Unit,
     onMessageInputChanged: (String) -> Unit,
     onSendMessageClicked: () -> Unit,
+    onRetrySendMessage: (Message) -> Unit,
     onClearHistoryClicked: () -> Unit,
     onConfirmClearHistory: () -> Unit,
     onDismissClearConfirm: () -> Unit,
     onDismissConnectionDialog: () -> Unit,
+    onToggleDiagnosticPanel: () -> Unit,
     onRefreshLocalIp: () -> Unit,
     onConsumeSnackbar: () -> Unit
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     val listState = rememberLazyListState()
 
-    // Mostrar Snackbar cuando cambia el mensaje en el UiState
     uiState.snackbarMessage?.let { message ->
         LaunchedEffect(message) {
             snackbarHostState.showSnackbar(message)
@@ -158,7 +161,6 @@ fun MobileConnectApp(
         }
     }
 
-    // Desplazamiento automático al último mensaje enviado o recibido
     LaunchedEffect(uiState.messages.size) {
         if (uiState.messages.isNotEmpty()) {
             listState.animateScrollToItem(uiState.messages.size - 1)
@@ -169,7 +171,8 @@ fun MobileConnectApp(
         topBar = {
             TopAppBarSection(
                 isConnected = uiState.isConnected,
-                connectedRemoteIp = uiState.connectedRemoteIp
+                connectedRemoteIp = uiState.connectedRemoteIp,
+                onToggleDiagnosticPanel = onToggleDiagnosticPanel
             )
         },
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) }
@@ -179,18 +182,26 @@ fun MobileConnectApp(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
+                .padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
 
-            // 1. TARJETA DE CONEXIÓN POR IP Y MOSTRADOR DE ROL
+            // PANEL DE DIAGNÓSTICO COLAPSABLE
+            if (uiState.showDiagnosticPanel) {
+                DiagnosticPanelCard(diagState = uiState.diagnosticState)
+            }
+
+            // 1. TARJETA DE CONEXIÓN POR IP Y PUERTO
             ConnectionCardSection(
                 localIp = uiState.localIp,
                 remoteIpInput = uiState.remoteIpInput,
+                remotePortInput = uiState.remotePortInput,
                 ipError = uiState.ipError,
+                portError = uiState.portError,
                 isConnecting = uiState.isConnecting,
                 myRole = uiState.myRole,
                 onRemoteIpChanged = onRemoteIpChanged,
+                onRemotePortChanged = onRemotePortChanged,
                 onConnectClicked = onConnectClicked,
                 onRefreshLocalIp = onRefreshLocalIp
             )
@@ -219,21 +230,21 @@ fun MobileConnectApp(
                     colors = ButtonDefaults.outlinedButtonColors(
                         contentColor = MaterialTheme.colorScheme.error
                     ),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Delete,
                         contentDescription = "Limpiar Historial",
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                     Spacer(modifier = Modifier.width(4.dp))
-                    Text(text = "Limpiar historial", fontSize = 13.sp)
+                    Text(text = "Limpiar historial", fontSize = 12.sp)
                 }
             }
 
             HorizontalDivider()
 
-            // 4. LISTA DE CONVERSACIÓN (LazyColumn)
+            // 4. LISTA DE CONVERSACIÓN
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -258,7 +269,8 @@ fun MobileConnectApp(
                             ) {
                                 MessageBubbleView(
                                     message = message,
-                                    myRole = uiState.myRole
+                                    myRole = uiState.myRole,
+                                    onRetrySendMessage = onRetrySendMessage
                                 )
                             }
                         }
@@ -277,11 +289,7 @@ fun MobileConnectApp(
         }
     }
 
-    // --------------------------------------------------------------------------------
-    // DIÁLOGOS DE ALERTA DE LA APLICACIÓN
-    // --------------------------------------------------------------------------------
-
-    // Diálogo 1: Alerta de Conexión Establecida o Error de Red
+    // DIÁLOGOS DE ALERTA
     if (uiState.showConnectionDialog) {
         AlertDialog(
             onDismissRequest = onDismissConnectionDialog,
@@ -302,7 +310,6 @@ fun MobileConnectApp(
         )
     }
 
-    // Diálogo 2: Confirmación antes de limpiar el historial
     if (uiState.showClearConfirmDialog) {
         AlertDialog(
             onDismissRequest = onDismissClearConfirm,
@@ -332,13 +339,14 @@ fun MobileConnectApp(
 }
 
 /**
- * COMPOSABLE: Barra superior (TopAppBar) con el título de la app e indicador de estado de red.
+ * COMPOSABLE: TopAppBar con botón de acceso al panel de diagnóstico.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TopAppBarSection(
     isConnected: Boolean,
-    connectedRemoteIp: String?
+    connectedRemoteIp: String?,
+    onToggleDiagnosticPanel: () -> Unit
 ) {
     CenterAlignedTopAppBar(
         title = {
@@ -352,7 +360,6 @@ fun TopAppBarSection(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    // Círculo de estado verde (conectado) o rojo (desconectado)
                     Box(
                         modifier = Modifier
                             .size(10.dp)
@@ -371,6 +378,15 @@ fun TopAppBarSection(
                 }
             }
         },
+        actions = {
+            IconButton(onClick = onToggleDiagnosticPanel) {
+                Icon(
+                    imageVector = Icons.Default.BugReport,
+                    contentDescription = "Panel de Diagnóstico",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        },
         colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
             containerColor = MaterialTheme.colorScheme.primaryContainer
         )
@@ -378,16 +394,64 @@ fun TopAppBarSection(
 }
 
 /**
- * COMPOSABLE: Tarjeta de conexión por IP con detección automática e ingreso de la IP remota.
+ * COMPOSABLE: Panel de diagnóstico técnico colapsable.
+ */
+@Composable
+fun DiagnosticPanelCard(diagState: NetworkDiagnosticState) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Text(
+                text = "🛠️ Panel de Diagnóstico de Red TCP",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold
+            )
+            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+            Text(
+                text = "• Servidor TCP: ${if (diagState.isServerListening) "Escuchando en 0.0.0.0:${diagState.serverPort}" else "Detenido"}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                text = "• Socket Remoto: ${diagState.connectedRemoteAddress ?: "Ninguno (Desconectado)"}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            Text(
+                text = "• Última Actividad: ${diagState.lastActivityTime}",
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (!diagState.lastError.isNullOrBlank()) {
+                Text(
+                    text = "• Último Error: ${diagState.lastError}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+}
+
+/**
+ * COMPOSABLE: Tarjeta de conexión con IP y Puerto configurable.
  */
 @Composable
 fun ConnectionCardSection(
     localIp: String,
     remoteIpInput: String,
+    remotePortInput: String,
     ipError: String?,
+    portError: String?,
     isConnecting: Boolean,
     myRole: Role,
     onRemoteIpChanged: (String) -> Unit,
+    onRemotePortChanged: (String) -> Unit,
     onConnectClicked: () -> Unit,
     onRefreshLocalIp: () -> Unit
 ) {
@@ -398,11 +462,10 @@ fun ConnectionCardSection(
         )
     ) {
         Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
 
-            // Mi IP local detectada de forma automática
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -413,7 +476,7 @@ fun ConnectionCardSection(
                         imageVector = Icons.Default.Wifi,
                         contentDescription = null,
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(20.dp)
+                        modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
@@ -431,32 +494,46 @@ fun ConnectionCardSection(
 
                 IconButton(
                     onClick = onRefreshLocalIp,
-                    modifier = Modifier.size(28.dp)
+                    modifier = Modifier.size(26.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Refresh,
                         contentDescription = "Refrescar IP local",
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
 
-            // Campo de texto para ingresar la IP del otro dispositivo
+            // Campos de entrada: IP + Puerto
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 OutlinedTextField(
                     value = remoteIpInput,
                     onValueChange = onRemoteIpChanged,
-                    modifier = Modifier.weight(1f),
-                    label = { Text("IP del otro dispositivo") },
+                    modifier = Modifier.weight(1.8f),
+                    label = { Text("IP remota") },
                     placeholder = { Text("Ej: 192.168.1.15") },
                     singleLine = true,
                     isError = ipError != null,
                     supportingText = if (ipError != null) {
-                        { Text(text = ipError, color = MaterialTheme.colorScheme.error) }
+                        { Text(text = ipError, color = MaterialTheme.colorScheme.error, fontSize = 11.sp) }
+                    } else null,
+                    shape = RoundedCornerShape(10.dp)
+                )
+
+                OutlinedTextField(
+                    value = remotePortInput,
+                    onValueChange = onRemotePortChanged,
+                    modifier = Modifier.weight(1f),
+                    label = { Text("Puerto") },
+                    placeholder = { Text("8888") },
+                    singleLine = true,
+                    isError = portError != null,
+                    supportingText = if (portError != null) {
+                        { Text(text = portError, color = MaterialTheme.colorScheme.error, fontSize = 11.sp) }
                     } else null,
                     shape = RoundedCornerShape(10.dp)
                 )
@@ -465,21 +542,22 @@ fun ConnectionCardSection(
                     onClick = onConnectClicked,
                     enabled = !isConnecting,
                     shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.height(56.dp)
+                    modifier = Modifier
+                        .height(56.dp)
+                        .padding(top = 4.dp)
                 ) {
                     if (isConnecting) {
                         CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
+                            modifier = Modifier.size(18.dp),
                             color = MaterialTheme.colorScheme.onPrimary,
                             strokeWidth = 2.dp
                         )
                     } else {
-                        Text("Conectar")
+                        Text("Conectar", fontSize = 12.sp)
                     }
                 }
             }
 
-            // Muestra del rol del dispositivo
             Surface(
                 shape = RoundedCornerShape(8.dp),
                 color = when (myRole) {
@@ -490,14 +568,14 @@ fun ConnectionCardSection(
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Row(
-                    modifier = Modifier.padding(10.dp),
+                    modifier = Modifier.padding(8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
                         imageVector = if (myRole == Role.NONE) Icons.Default.Info else Icons.Default.CheckCircle,
                         contentDescription = null,
-                        modifier = Modifier.size(18.dp),
+                        modifier = Modifier.size(16.dp),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Column {
@@ -519,9 +597,6 @@ fun ConnectionCardSection(
     }
 }
 
-/**
- * COMPOSABLE: Muestra los contadores globales de mensajes enviados por cada dispositivo.
- */
 @Composable
 fun CountersCardSection(
     counterA: Int,
@@ -537,7 +612,7 @@ fun CountersCardSection(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(10.dp),
+                .padding(8.dp),
             horizontalArrangement = Arrangement.SpaceAround,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -548,7 +623,7 @@ fun CountersCardSection(
             )
 
             Text(
-                text = "Total: $totalMessages",
+                text = "Total entregados: $totalMessages",
                 style = MaterialTheme.typography.bodySmall,
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -563,9 +638,6 @@ fun CountersCardSection(
     }
 }
 
-/**
- * COMPOSABLE: Insignia de conteo individual de mensajes.
- */
 @Composable
 fun DeviceCounterBadge(
     deviceName: String,
@@ -577,7 +649,7 @@ fun DeviceCounterBadge(
         color = containerColor
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
@@ -599,9 +671,6 @@ fun DeviceCounterBadge(
     }
 }
 
-/**
- * COMPOSABLE: Vista vacía cuando no hay mensajes en la conversación.
- */
 @Composable
 fun EmptyConversationView() {
     Box(
@@ -616,7 +685,7 @@ fun EmptyConversationView() {
                 imageVector = Icons.Default.Refresh,
                 contentDescription = null,
                 tint = Color.Gray,
-                modifier = Modifier.size(48.dp)
+                modifier = Modifier.size(44.dp)
             )
             Spacer(modifier = Modifier.height(8.dp))
             Text(
@@ -625,26 +694,25 @@ fun EmptyConversationView() {
                 color = Color.Gray
             )
             Text(
-                text = "Ingresa la IP del otro dispositivo, conecta y escribe un mensaje para iniciar.",
+                text = "Ingresa la IP del otro dispositivo, conecta y envía un mensaje.",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.Gray,
                 textAlign = TextAlign.Center,
-                modifier = Modifier.padding(horizontal = 24.dp)
+                modifier = Modifier.padding(horizontal = 20.dp)
             )
         }
     }
 }
 
 /**
- * COMPOSABLE: Burbuja de conversación individual.
- * Mis mensajes se posicionan a la derecha y los remotos a la izquierda.
+ * COMPOSABLE: Burbuja de conversación con estado de entrega (ACK) y botón de reintento.
  */
 @Composable
 fun MessageBubbleView(
     message: Message,
-    myRole: Role
+    myRole: Role,
+    onRetrySendMessage: (Message) -> Unit
 ) {
-    // Si mi rol coincide con el senderRole del mensaje, el mensaje es propio (se dibuja a la derecha)
     val isMyMessage = (myRole != Role.NONE && message.senderRole == myRole)
 
     val alignment = if (isMyMessage) Alignment.End else Alignment.Start
@@ -675,9 +743,8 @@ fun MessageBubbleView(
                     )
                 )
                 .background(bubbleColor)
-                .padding(12.dp)
+                .padding(10.dp)
         ) {
-            // Emisor (Dispositivo A o Dispositivo B)
             Text(
                 text = message.senderRole.shortName(),
                 style = MaterialTheme.typography.labelMedium,
@@ -687,7 +754,6 @@ fun MessageBubbleView(
 
             Spacer(modifier = Modifier.height(4.dp))
 
-            // Contenido del mensaje
             Text(
                 text = message.text,
                 style = MaterialTheme.typography.bodyLarge,
@@ -696,20 +762,62 @@ fun MessageBubbleView(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Hora de envío en formato HH:mm
-            Text(
-                text = message.timestamp,
-                style = MaterialTheme.typography.labelSmall,
-                color = textColor.copy(alpha = 0.6f),
-                modifier = Modifier.align(Alignment.End)
-            )
+            Row(
+                modifier = Modifier.align(Alignment.End),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = message.timestamp,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = textColor.copy(alpha = 0.6f)
+                )
+
+                // Indicador visual de confirmación ACK
+                if (isMyMessage) {
+                    when (message.status) {
+                        MessageStatus.PENDING -> {
+                            Icon(
+                                imageVector = Icons.Default.Schedule,
+                                contentDescription = "Enviando...",
+                                modifier = Modifier.size(12.dp),
+                                tint = textColor.copy(alpha = 0.5f)
+                            )
+                        }
+                        MessageStatus.SENT -> {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Entregado (ACK)",
+                                modifier = Modifier.size(12.dp),
+                                tint = Color(0xFF4CAF50)
+                            )
+                        }
+                        MessageStatus.FAILED -> {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.clickable { onRetrySendMessage(message) }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Error,
+                                    contentDescription = "No enviado",
+                                    modifier = Modifier.size(12.dp),
+                                    tint = MaterialTheme.colorScheme.error
+                                )
+                                Text(
+                                    text = " Reintentar",
+                                    fontSize = 10.sp,
+                                    color = MaterialTheme.colorScheme.error,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
 
-/**
- * COMPOSABLE: Barra inferior de redacción y envío de mensajes con validación.
- */
 @Composable
 fun MessageInputSection(
     messageInput: String,
@@ -751,7 +859,6 @@ fun MessageInputSection(
             }
         }
 
-        // Indicador de caracteres restantes (máximo 200)
         Text(
             text = "${messageInput.length} / 200 caracteres",
             style = MaterialTheme.typography.labelSmall,
