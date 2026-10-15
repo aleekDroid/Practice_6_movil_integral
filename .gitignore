@@ -1,0 +1,84 @@
+# ====================================================================
+# Android Studio & Gradle - Complete .gitignore
+# ====================================================================
+
+# Built application files
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Java & Kotlin compiled class files
+*.class
+
+# Generated build directories
+/bin/
+/gen/
+/out/
+/build/
+*/build/
+app/build/
+
+# Local configuration files (contains local SDK path)
+local.properties
+
+# Gradle build cache & settings
+.gradle/
+gradle-app.setting
+
+# IntelliJ IDEA / Android Studio project files
+.idea/
+!.idea/copyright/
+!.idea/icon.json
+*.iml
+*.iws
+*.ipr
+.idea/modules.xml
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/navEditor.xml
+.idea/assetWizardSettings.xml
+.idea/caches/
+.idea/libraries/
+.idea/compiler.xml
+.idea/jarRepositories.xml
+
+# Android Studio Captures & Profiling
+/captures/
+*.hprof
+
+# C/C++ Native builds (NDK / CMake / ndk-build)
+.externalNativeBuild/
+.cxx/
+*.so
+
+# Keystore & Signing files (DO NOT COMMIT SECRETS)
+*.jks
+*.keystore
+*.pepk
+*.p12
+*.pem
+*.pk8
+
+# Sensitive configuration & API key files
+google-services.json
+secrets.properties
+
+# Operating System files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Log & Temporary files
+*.log
+*~
+*.swp
+*.bak
+*.tmp
+
+# Artifacts directory
+.artifacts/
